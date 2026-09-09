@@ -1,0 +1,20 @@
+# --- Web framework ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+python-dotenv>=1.0
+python-multipart>=0.0.9
+
+# --- Browser layer (Person 2 -- Playwright automation) ---
+playwright>=1.43
+
+# --- Voice layer (Person 1 -- STT + TTS) ---
+requests>=2.31
+# openai-whisper is optional: only needed if STT_ENGINE=whisper_local.
+# openai-whisper
+
+# --- LLM orchestration ---
+# Only needed if LLM_ENGINE=gemini in .env. Default LLM_ENGINE=mock needs
+# no extra package at all.
+google-genai>=0.1.0
+

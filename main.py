@@ -186,8 +186,9 @@ async def ws_endpoint(websocket: WebSocket):
 
             if action == "utterance":
                 text = data.get("text", "")
+                lang = data.get("lang")
                 if text.strip():
-                    await task_manager.handle_utterance(text, hub.broadcast)
+                    await task_manager.handle_utterance(text, hub.broadcast, stt_language=lang or "und")
 
             elif action == "reset":
                 task_manager.reset()

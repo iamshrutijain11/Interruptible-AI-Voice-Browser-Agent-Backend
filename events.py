@@ -31,12 +31,25 @@ def browser_started(task_id: str) -> dict:
     return {"type": "browser.started", "task_id": task_id}
 
 
-def browser_result(task_id: str, results: List[Dict[str, Any]]) -> dict:
-    return {"type": "browser.result", "task_id": task_id, "results": results}
+def browser_result(
+    task_id: str,
+    results: List[Dict[str, Any]],
+    is_fallback: bool = False,
+    warning: Optional[str] = None,
+    source: Optional[str] = None,
+) -> dict:
+    return {
+        "type": "browser.result",
+        "task_id": task_id,
+        "results": results,
+        "is_fallback": is_fallback,
+        "warning": warning,
+        "source": source,
+    }
 
 
-def speech_started(task_id: str, text: str) -> dict:
-    return {"type": "speech.started", "task_id": task_id, "text": text}
+def speech_started(task_id: str, text: str, language: str = "en") -> dict:
+    return {"type": "speech.started", "task_id": task_id, "text": text, "language": language}
 
 
 def task_completed(task_id: str) -> dict:

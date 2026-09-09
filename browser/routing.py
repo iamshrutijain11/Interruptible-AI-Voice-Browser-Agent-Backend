@@ -17,26 +17,42 @@ FASHION_KEYWORDS = {
     "shirt", "tshirt", "t-shirt", "dress", "dresses", "jeans", "jacket", "jackets",
     "kurti", "kurtis", "saree", "sarees", "hoodie", "hoodies", "pants", "trousers",
     "top", "tops", "skirt", "suit", "blazer", "ethnic", "wear", "cloth", "clothes",
-    "clothing", "sweatshirt", "sweater", "joggers", "trackpants", "kurta", "lehenga"
+    "clothing", "sweatshirt", "sweater", "joggers", "trackpants", "kurta", "lehenga",
+    # Indic transliteration
+    "joote", "joota", "chappal", "kapda", "kapde", "kameez", "dupatta",
 }
 
 BEAUTY_KEYWORDS = {
     "makeup", "cosmetics", "lipstick", "lipsticks", "skincare", "skin", "perfume",
     "perfumes", "fragrance", "cologne", "serum", "lotion", "moisturizer", "kajal",
     "foundation", "eyeliner", "mascara", "shampoo", "conditioner", "sunscreen",
-    "face wash", "facewash", "nail polish", "lip balm", "concealer", "blush"
+    "face wash", "facewash", "nail polish", "lip balm", "concealer", "blush",
+    # Indic transliteration
+    "attar", "itr", "khushbu", "sugandh", "tel", "ubtan",
 }
 
 BUDGET_KEYWORDS = {
     "cheap", "under 500", "under 300", "under 200", "under 100", "affordable",
-    "budget", "lowest price", "low price", "cheapest"
+    "budget", "lowest price", "low price", "cheapest",
+    # Indic: sasta, kam daam
+    "sasta", "kam daam", "ucit",
 }
 
 ELECTRONICS_TECH_KEYWORDS = {
     "laptop", "laptops", "phone", "phones", "mobile", "smartphone", "smartphones",
     "headphones", "earbuds", "earphone", "earphones", "headset", "mouse", "mice",
     "keyboard", "keyboards", "monitor", "charger", "cable", "tablet", "ipad",
-    "watch", "smartwatch", "speaker", "speakers", "powerbank", "gadget", "gadgets"
+    "watch", "smartwatch", "speaker", "speakers", "powerbank", "gadget", "gadgets",
+    # Indic transliteration
+    "ghadi", "earfon", "mobail", "fon",
+}
+
+HOME_APPLIANCE_KEYWORDS = {
+    "fan", "pankha", "pankhe", "ceiling fan", "table fan", "exhaust fan",
+    "cooler", "ac", "air conditioner", "fridge", "refrigerator", "washing machine",
+    "microwave", "mixer", "grinder", "iron", "vacuum cleaner", "heater",
+    # Indic transliteration
+    "pankha", "pankhe", "farij", "almirah",
 }
 
 
@@ -53,12 +69,14 @@ def get_parallel_sites_for_query(query: str) -> list[str]:
     """
     Returns the list of relevant live shopping sites to search simultaneously in parallel.
     Multi-website comparison ensures top recommendations come from multiple distinct platforms.
+    Supports English, Indic transliteration, and multilingual aliases.
     """
     if not query:
         return ["amazon", "snapdeal"]
 
     q_lower = query.lower()
-    tokens = set(re.findall(r"[a-z0-9]+", q_lower))
+    # Include both ASCII and Unicode tokens (re.findall with \w+ catches Unicode)
+    tokens = set(re.findall(r"[\w]+", q_lower))
 
     def _matches(kws: set) -> bool:
         for k in kws:
@@ -74,23 +92,27 @@ def get_parallel_sites_for_query(query: str) -> list[str]:
         if store in q_lower:
             return [store, "amazon"]
 
-    # 1. Beauty / Cosmetics signals -> Amazon + Snapdeal (fastest live multi-store pair)
+    # 1. Beauty / Cosmetics signals -> Nykaa + Amazon
     if _matches(BEAUTY_KEYWORDS):
-        return ["amazon", "snapdeal"]
+        return ["nykaa", "amazon"]
 
-    # 2. Fashion / Apparel signals -> Amazon + Snapdeal
+    # 2. Fashion / Apparel signals -> Myntra + Amazon
     if _matches(FASHION_KEYWORDS):
-        return ["amazon", "snapdeal"]
+        return ["myntra", "amazon"]
 
-    # 3. Budget signals (< 500) -> Amazon + Snapdeal
+    # 3. Budget signals (< 500) -> Meesho + Snapdeal
     if _is_budget(q_lower):
-        return ["amazon", "snapdeal"]
+        return ["meesho", "snapdeal"]
 
     # 4. Electronics / Tech -> Amazon + Snapdeal
     if _matches(ELECTRONICS_TECH_KEYWORDS):
         return ["amazon", "snapdeal"]
 
-    # 5. Default general merchandise -> Amazon + Snapdeal
+    # 5. Home appliances (fan/pankha, fridge, AC) -> Amazon + Snapdeal
+    if _matches(HOME_APPLIANCE_KEYWORDS):
+        return ["amazon", "snapdeal"]
+
+    # 6. Default general merchandise -> Amazon + Snapdeal
     return ["amazon", "snapdeal"]
 
 

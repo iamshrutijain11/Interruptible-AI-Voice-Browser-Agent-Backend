@@ -143,6 +143,28 @@ def _extract_product_phrase(text: str, color: Optional[str] = None) -> str:
     return " ".join(words).strip()
 
 
+_INDIC_TRANSLITERATIONS = {
+    "pankha": "ceiling fan",
+    "pankhe": "ceiling fan",
+    "pankho": "ceiling fan",
+    "joote": "shoes",
+    "joota": "shoes",
+    "chappal": "sandals",
+    "chappalein": "sandals",
+    "ghadi": "watch",
+    "gadi": "watch",
+    "kapda": "clothes",
+    "kapde": "clothes",
+    "kameez": "shirt",
+    "kitab": "book",
+    "kitabein": "books",
+    "pustak": "book",
+    "khushbu": "perfume",
+    "attar": "perfume",
+    "itr": "perfume",
+}
+
+
 def parse_utterance_mock(
     text: str,
     prior: Optional[ParsedIntent] = None,
@@ -184,12 +206,26 @@ def parse_utterance_mock(
         if not product_phrase:
             product_phrase = prior.query
 
-    # Mock mode: query_en == query (assumed English best-effort)
+    # Translate known Indic transliterations to English for search sites
+    words_en = []
+    for w in product_phrase.lower().split():
+        words_en.append(_INDIC_TRANSLITERATIONS.get(w, w))
+    query_en = " ".join(words_en) or product_phrase
+
     effective_lang = stt_language if stt_language not in ("und", "") else "en"
+    if any(0x0900 <= ord(c) <= 0x097F for c in cleaned):
+        effective_lang = "hi"
+    elif any(0x0600 <= ord(c) <= 0x06FF for c in cleaned):
+        effective_lang = "ar"
+    elif any((0x3040 <= ord(c) <= 0x30FF) or (0x4E00 <= ord(c) <= 0x9FFF) for c in cleaned):
+        effective_lang = "ja"
+    elif any(w in _INDIC_TRANSLITERATIONS for w in cleaned.lower().split()):
+        effective_lang = "hi"
+
     return ParsedIntent(
         intent="product_search",
         query=product_phrase,
-        query_en=product_phrase,          # best-effort: assumed English
+        query_en=query_en,
         constraints=constraints,
         detected_language=effective_lang,
     )
@@ -303,21 +339,20 @@ async def parse_utterance(
     parsing (< 1ms). If product or constraint parameters are identified,
     return immediately. Falls back to Gemini for non-English or ambiguous input.
     """
-    if stt_language in ("en", "und", ""):
-        intent_fast = parse_utterance_mock(text, prior, stt_language=stt_language)
-        if intent_fast.query or (prior and (intent_fast.constraints.max_price or intent_fast.constraints.min_price or intent_fast.constraints.size)):
-            logger.info(f"[agent/fast-path] Intent parsed instantly (<1ms): query={intent_fast.query!r}")
-            return intent_fast
-
     engine = os.getenv("LLM_ENGINE", "mock").lower()
+    has_api_key = bool(os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY"))
 
-    if engine in ("gemini", "openai"):
+    # When Gemini is enabled with an API key, use it for genuine multilingual parsing
+    # and accurate query translation (unless purely English ASCII in mock mode).
+    if engine in ("gemini", "openai") and has_api_key:
         try:
             return await parse_utterance_gemini(text, prior, stt_language=stt_language)
         except Exception as e:
             logger.warning(f"Gemini intent parsing failed ({e}); falling back to mock parser.")
 
-    return parse_utterance_mock(text, prior, stt_language=stt_language)
+    # High-speed rule-based mock path
+    intent_mock = parse_utterance_mock(text, prior, stt_language=stt_language)
+    return intent_mock
 
 
 async def translate_text(text: str, target_lang: str) -> str:

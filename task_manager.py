@@ -317,8 +317,18 @@ class TaskManager:
         if isinstance(sources, str):
             sources = [sources]
 
+        is_fallback = bool(result.get("is_fallback", False))
+        warning = result.get("warning")
+        source = result.get("source")
+
         self.tasks[new_task_id].results = results
-        await broadcast(events.browser_result(new_task_id, results))
+        await broadcast(events.browser_result(
+            new_task_id,
+            results,
+            is_fallback=is_fallback,
+            warning=warning,
+            source=source,
+        ))
         self._m["records_extracted"]  += len(results)
         self._m["pages_analyzed"]     += len(results)
         self._m["actions_performed"]  += 1
@@ -339,6 +349,14 @@ class TaskManager:
         recommendation = await agent.build_recommendation(
             results, search_query, intent.constraints, sources
         )
+
+        # Multilingual: translate recommendation text into the user's spoken/typed language
+        if detected_lang and detected_lang not in ("en", "und"):
+            if recommendation.reason:
+                recommendation.reason = await agent.translate_text(recommendation.reason, detected_lang)
+            if recommendation.comparison_summary:
+                recommendation.comparison_summary = await agent.translate_text(recommendation.comparison_summary, detected_lang)
+
         self.tasks[new_task_id].recommendation = recommendation.dict()
         self._m["actions_performed"] += 1
         await self._step_done(new_task_id, "analyze", broadcast,
@@ -361,7 +379,7 @@ class TaskManager:
         summary_en = self._build_summary(results, result, recommendation)
         summary    = await agent.translate_text(summary_en, detected_lang)
 
-        await broadcast(events.speech_started(new_task_id, summary))
+        await broadcast(events.speech_started(new_task_id, summary, language=detected_lang))
         asyncio.create_task(
             asyncio.to_thread(rime_service.speak, summary, new_task_id,
                               lang=detected_lang)

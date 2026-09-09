@@ -36,17 +36,22 @@ import os
 import re
 import logging
 import random
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 from urllib.parse import quote_plus
+import asyncio
+
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 from .browser import browser_manager
 from .task_control import registry
+from .routing import route_query, get_parallel_sites_for_query
 from .extraction import (
     extract_products_generic,
     filter_and_rank,
+    parse_price_range,
     parse_max_price,
+    parse_min_price,
     parse_size,
 )
 
@@ -58,13 +63,11 @@ MAX_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "10"))
 
 logger = logging.getLogger(__name__)
 
-# Primary: Amazon.in -- accessible from this network when Flipkart is not
 AMAZON_SEARCH_URL = "https://www.amazon.in/s?k={query}&ref=nb_sb_noss"
-
-# Legacy / secondary attempt (often unreachable -- kept for completeness)
+SNAPDEAL_SEARCH_URL = "https://www.snapdeal.com/search?keyword={query}"
+NYKAA_SEARCH_URL = "https://www.nykaa.com/search/result/?q={query}"
+MEESHO_SEARCH_URL = "https://www.meesho.com/search?q={query}"
 FLIPKART_SEARCH_URL = "https://www.flipkart.com/search?q={query}"
-
-FALLBACK_PAGE_PATH = os.path.join(os.path.dirname(__file__), "fallback_page.html")
 
 
 def _clean_error(task_id: str, message: str) -> Dict[str, Any]:
@@ -93,46 +96,20 @@ def _build_clean_query(query: str) -> str:
 
 async def _run_amazon_search(page, query: str):
     """
-    Navigate to Amazon.in and extract products.
-
-    Amazon.in CSS selectors (verified 2025-09):
-      Card:  div[data-component-type="s-search-result"]
-             (attribute-based -- very stable, Amazon has used this for years)
-      Name:  h2.a-size-mini span.a-text-normal  OR  h2 span
-             (structural -- also stable)
-      Price: span.a-price-whole  OR  span.a-offscreen
-      Link:  h2 a  (relative href starting with /)
-      Image: img.s-image
-
-    Fallback selector set uses broader attribute/structural patterns that
-    survive minor Amazon A/B layout changes.
+    Navigate to Amazon.in and extract products using fast commit-based loading.
     """
     clean_q = _build_clean_query(query)
     url = AMAZON_SEARCH_URL.format(query=quote_plus(clean_q))
-
     logger.info("[amazon] Searching: %r -> URL: %s", clean_q, url)
 
-    # Brief delay before navigation (looks less robotic)
-    await page.wait_for_timeout(random.randint(200, 400))
-
-    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-
-    # Brief post-load wait for price widgets to settle
-    await page.wait_for_timeout(300)
-
+    await page.goto(url, wait_until="commit", timeout=12000)
 
     title = await page.title()
     logger.info("[amazon] Page title: %r | URL: %r", title, page.url)
-
-    # Bail out early if Amazon showed a captcha or login page
     if any(kw in title.lower() for kw in ("robot", "captcha", "sign in", "verify")):
         logger.warning("[amazon] Bot/captcha/login wall detected, aborting Amazon search")
         return []
 
-    # Primary selector set -- attribute-based card identifier (very stable)
-    # LINK NOTE: Amazon's h2 a element exists but has an empty href attribute --
-    # the actual product URL lives on a.a-link-normal[href*='/dp/'] inside the card.
-    # This was confirmed via [href-debug] logging showing hrefRaw='' for h2 a.
     selector_sets = [
         {
             "card":  'div[data-component-type="s-search-result"]',
@@ -141,7 +118,6 @@ async def _run_amazon_search(page, query: str):
             "link":  "a.a-link-normal[href*='/dp/'], a[href*='/dp/'], h2 a",
             "image": "img.s-image",
         },
-        # Broader fallback for A/B layout variants
         {
             "card":  "div.s-result-item[data-asin]",
             "name":  "span.a-text-normal, h2 span",
@@ -151,14 +127,15 @@ async def _run_amazon_search(page, query: str):
         },
     ]
 
-
     for sel in selector_sets:
         try:
-            card_count = await page.locator(sel["card"]).count()
-            logger.info("[amazon] Selector %r matched %d cards", sel["card"][:50], card_count)
-            if card_count == 0:
-                continue
-        except PlaywrightTimeoutError:
+            await page.wait_for_selector(sel["card"], state="attached", timeout=5000)
+        except Exception:
+            pass
+
+        card_count = await page.locator(sel["card"]).count()
+        logger.info("[amazon] Selector %r matched %d cards", sel["card"][:50], card_count)
+        if card_count == 0:
             continue
 
         products = await extract_products_generic(
@@ -171,23 +148,163 @@ async def _run_amazon_search(page, query: str):
         )
         logger.info("[amazon] Extracted %d products from selector set", len(products))
         if products:
-            # Convert relative Amazon hrefs to absolute
             for p in products:
-                if p.get("url") and p["url"].startswith("/"):
-                    p["url"] = "https://www.amazon.in" + p["url"]
+                if p.get("url") and not p["url"].startswith("http"):
+                    p["url"] = "https://www.amazon.in/" + p["url"].lstrip("/")
             return products
 
     logger.warning("[amazon] No products extracted from any selector set")
     return []
 
 
+async def _run_myntra_search(page, query: str):
+    """
+    Search Myntra for apparel, shoes, and fashion products.
+    """
+    clean_q = _build_clean_query(query)
+    slug = re.sub(r"\s+", "-", clean_q.strip().lower())
+    url = f"https://www.myntra.com/{slug}"
+    logger.info("[myntra] Searching: %r -> URL: %s", clean_q, url)
+
+    await page.goto(url, wait_until="commit", timeout=8000)
+
+    try:
+        await page.wait_for_selector("li.product-base", state="attached", timeout=4000)
+    except Exception:
+        pass
+
+    title = await page.title()
+    logger.info("[myntra] Page title: %r | URL: %r", title, page.url)
+    if any(kw in title.lower() for kw in ("robot", "captcha", "access denied", "block")):
+        logger.warning("[myntra] Bot block detected, aborting Myntra search")
+        return []
+
+    products = await extract_products_generic(
+        page,
+        card_selector="li.product-base",
+        name_selector="h3.product-brand, h4.product-product, .product-title",
+        price_selector="span.product-discountedPrice, div.product-price, span.product-strike",
+        link_selector="a[href]",
+        image_selector="img.product-image, img",
+    )
+    logger.info("[myntra] Extracted %d products", len(products))
+    for p in products:
+        if p.get("url") and not p["url"].startswith("http"):
+            p["url"] = "https://www.myntra.com/" + p["url"].lstrip("/")
+    return products
+
+
+async def _run_nykaa_search(page, query: str):
+    """
+    Search Nykaa for beauty, makeup, cosmetics, skincare, and fragrance products.
+    """
+    clean_q = _build_clean_query(query)
+    url = NYKAA_SEARCH_URL.format(query=quote_plus(clean_q))
+    logger.info("[nykaa] Searching: %r -> URL: %s", clean_q, url)
+
+    await page.goto(url, wait_until="commit", timeout=8000)
+
+    try:
+        await page.wait_for_selector("div.productWrapper, a[href*='/p/']", state="attached", timeout=4000)
+    except Exception:
+        pass
+
+    title = await page.title()
+    logger.info("[nykaa] Page title: %r | URL: %r", title, page.url)
+    if any(kw in title.lower() for kw in ("robot", "captcha", "access denied", "block")):
+        logger.warning("[nykaa] Bot block detected, aborting Nykaa search")
+        return []
+
+    products = await extract_products_generic(
+        page,
+        card_selector="div.productWrapper, div[class*='productWrapper'], div.product-card, div[class*='product-list-box'], a[href*='/p/'][href*='productId'], a[href*='/p/']",
+        name_selector="div[class*='title'], [class*='product-title'], h2, h3, div[class*='xrzmfa']",
+        price_selector="span[class*='price'], [class*='post-discount-price'], [class*='price'], span",
+        link_selector="a[href*='/p/'], a[href]",
+        image_selector="img",
+    )
+    logger.info("[nykaa] Extracted %d products", len(products))
+    for p in products:
+        if p.get("url") and not p["url"].startswith("http"):
+            p["url"] = "https://www.nykaa.com/" + p["url"].lstrip("/")
+    return products
+
+
+async def _run_meesho_search(page, query: str):
+    """
+    Search Meesho for budget-friendly merchandise and value items.
+    """
+    clean_q = _build_clean_query(query)
+    url = MEESHO_SEARCH_URL.format(query=quote_plus(clean_q))
+    logger.info("[meesho] Searching: %r -> URL: %s", clean_q, url)
+
+    await page.goto(url, wait_until="commit", timeout=8000)
+
+    try:
+        await page.wait_for_selector("a[href*='/p/']", state="attached", timeout=4000)
+    except Exception:
+        pass
+
+    title = await page.title()
+    logger.info("[meesho] Page title: %r | URL: %r", title, page.url)
+    if any(kw in title.lower() for kw in ("robot", "captcha", "access denied", "block")):
+        logger.warning("[meesho] Bot block detected, aborting Meesho search")
+        return []
+
+    products = await extract_products_generic(
+        page,
+        card_selector="a[href*='/p/'], div[class*='ProductList'] a",
+        name_selector="p[class*='title'], p, span",
+        price_selector="h5, p[class*='price'], span",
+        link_selector="a[href]",
+        image_selector="img",
+    )
+    logger.info("[meesho] Extracted %d products", len(products))
+    for p in products:
+        if p.get("url") and not p["url"].startswith("http"):
+            p["url"] = "https://www.meesho.com/" + p["url"].lstrip("/")
+    return products
+
+
+async def _run_snapdeal_search(page, query: str):
+    """
+    Search Snapdeal as a reliable general/budget e-commerce site.
+    """
+    clean_q = _build_clean_query(query)
+    url = SNAPDEAL_SEARCH_URL.format(query=quote_plus(clean_q))
+    logger.info("[snapdeal] Searching: %r -> URL: %s", clean_q, url)
+
+    await page.goto(url, wait_until="commit", timeout=8000)
+
+    try:
+        await page.wait_for_selector("div.product-tuple-listing", state="attached", timeout=3500)
+    except Exception:
+        pass
+
+    title = await page.title()
+    logger.info("[snapdeal] Page title: %r | URL: %r", title, page.url)
+    if any(kw in title.lower() for kw in ("robot", "captcha", "access denied", "block")):
+        logger.warning("[snapdeal] Bot block detected, aborting Snapdeal search")
+        return []
+
+    products = await extract_products_generic(
+        page,
+        card_selector="div.product-tuple-listing, div.col-xs-6.favDp",
+        name_selector="p.product-title, a.dp-widget-link p",
+        price_selector="span.product-price, span.lfloat.product-price",
+        link_selector="a.product-card-link, a.dp-widget-link",
+        image_selector="img.product-image",
+    )
+    logger.info("[snapdeal] Extracted %d products", len(products))
+    for p in products:
+        if p.get("url") and not p["url"].startswith("http"):
+            p["url"] = "https://www.snapdeal.com/" + p["url"].lstrip("/")
+    return products
+
+
 async def _run_flipkart_search(page, query: str):
     """
-    SECONDARY / LEGACY: Flipkart search.
-    NOTE: Flipkart is unreachable from this machine (DNS/connection failure,
-    confirmed 2026-09-08). This function is kept as a secondary attempt in
-    case network conditions change. If Flipkart loads, the selectors below
-    were last valid circa 2024 and may need refreshing via DevTools inspect.
+    Legacy Flipkart search attempt.
     """
     clean_q = _build_clean_query(query)
     url = FLIPKART_SEARCH_URL.format(query=quote_plus(clean_q))
@@ -203,7 +320,6 @@ async def _run_flipkart_search(page, query: str):
         logger.warning("[flipkart] Page failed to load (chrome-error or stuck loading)")
         return []
 
-    # Try to close login popup
     try:
         close_btn = page.locator("button._2KpZ6l._2doB4z")
         if await close_btn.count() > 0:
@@ -216,13 +332,6 @@ async def _run_flipkart_search(page, query: str):
             "card":  "div[data-id]",
             "name":  "div.KzDlHZ, a.wjcEIp, a.IRpwTa, div._4rR01T, a.s1Q9rs, a[title]",
             "price": "div.Nx9bqj, div._30jeq3, div.D2rA8n",
-            "link":  "a",
-            "image": "img",
-        },
-        {
-            "card":  "div._1AtVbE",
-            "name":  "div._4rR01T, a.s1Q9rs, a.IRpwTa",
-            "price": "div._30jeq3",
             "link":  "a",
             "image": "img",
         },
@@ -248,131 +357,180 @@ async def _run_flipkart_search(page, query: str):
     return []
 
 
-async def _run_fallback_search(page, query: str):
+SITE_RUNNERS = {
+    "amazon": _run_amazon_search,
+    "myntra": _run_myntra_search,
+    "nykaa": _run_nykaa_search,
+    "meesho": _run_meesho_search,
+    "snapdeal": _run_snapdeal_search,
+    "flipkart": _run_flipkart_search,
+}
+
+SITE_DISPLAY_NAMES = {
+    "amazon": "Amazon",
+    "snapdeal": "Snapdeal",
+    "myntra": "Myntra",
+    "nykaa": "Nykaa",
+    "meesho": "Meesho",
+    "flipkart": "Flipkart",
+}
+
+
+async def search_products(query: str, task_id: str, constraints: Optional[Any] = None) -> Dict[str, Any]:
     """
-    Local, clearly-labelled fallback. Real browser automation against a
-    real local page (not a hardcoded Python dict) -- but explicitly NOT
-    live web data, and every result carries a "source" tag saying so.
+    Real-browser product search querying multiple live shopping sites (Amazon,
+    Snapdeal, Myntra, Nykaa, Meesho) in parallel. Produces top recommendations
+    blended from multiple websites so users see options across distinct stores.
 
-    The local page accepts ?q=QUERY to filter cards to the right category.
-    """
-    clean_q = _build_clean_query(query)
-    file_url = "file://" + FALLBACK_PAGE_PATH + "?q=" + quote_plus(clean_q)
-    await page.goto(file_url, wait_until="domcontentloaded")
-    await page.wait_for_timeout(500)  # let JS filter run
-
-    products = await extract_products_generic(
-        page,
-        card_selector=".product-card",
-        name_selector=".product-name",
-        price_selector=".product-price",
-        link_selector="a.product-link",
-        image_selector="img.product-image",
-    )
-    for p in products:
-        p["source"] = "local_fallback_demo_page"
-        if not p.get("url") or "example.com" in p.get("url", ""):
-            p["url"] = f"https://www.amazon.in/s?k={quote_plus(p['name'])}"
-    return products
-
-
-async def search_products(query: str, task_id: str) -> Dict[str, Any]:
-    """
-    Real-browser product search with task versioning built in.
-
-    IMPORTANT: the caller must register the task BEFORE calling this, e.g.:
-        registry.create_task(task_id, query)
-        result = await search_products(query, task_id)
-    create_task() is what invalidates any previous "current" task -- this
-    function only checks/respects validity, it does not create tasks.
-
-    Args:
-        query: natural language query, e.g. "black running shoes under 1500 size 9"
-        task_id: unique id for this task.
-
-    Returns a JSON-serialisable dict, always shaped like:
-        {"task_id": ..., "status": ..., "results": [...], ...}
+    Workflow:
+      1. Determine relevant live shopping sites to query for this category.
+      2. Scrape target sites concurrently across isolated browser pages.
+      3. Filter and rank each store's products with constraints (price range, size).
+      4. Round-robin interleave top picks across stores so results feature diverse platforms.
+      5. Discard immediately if the task was superseded or interrupted.
     """
     if not registry.is_task_valid(task_id):
         return _stale(task_id)
 
     registry.mark_running(task_id)
 
-    max_price = parse_max_price(query)
-    size = parse_size(query)
+    if constraints is not None:
+        min_price = getattr(constraints, "min_price", None)
+        max_price = getattr(constraints, "max_price", None)
+        size = getattr(constraints, "size", None)
+        rank_by = getattr(constraints, "rank_by", None) or "price"
+    else:
+        min_price, max_price = parse_price_range(query)
+        size = parse_size(query)
+        rank_by = "bestseller_first" if re.search(r"\b(best|top rated|bestseller)\b", query, re.IGNORECASE) else "price"
 
     context = None
-    page = None
-    source_used = "amazon"
+    sites_to_search = get_parallel_sites_for_query(query)
+    logger.info("[routing] Query %r -> Searching sites in parallel: %s", query, sites_to_search)
 
     try:
         context = await browser_manager.new_context()
-        page = await context.new_page()
-        registry.attach_page(task_id, page)
 
         if not registry.is_task_valid(task_id):
             return _stale(task_id)
 
-        raw_products = []
-        primary_err = None
-
-        # --- ATTEMPT 1: Amazon.in (primary) ---
-        try:
-            raw_products = await _run_amazon_search(page, query)
-            if not raw_products:
-                raise RuntimeError("no_results_from_amazon")
-            source_used = "amazon"
-        except (PlaywrightTimeoutError, PlaywrightError, RuntimeError) as err1:
-            logger.warning("[search] Amazon failed: %s -- trying Flipkart", err1)
-            primary_err = err1
-
-            if not registry.is_task_valid(task_id):
-                return _stale(task_id)
-
-            # --- ATTEMPT 2: Flipkart (secondary, usually unreachable) ---
+        async def _scrape_site(site_name: str) -> list:
+            pg = await context.new_page()
+            registry.attach_page(task_id, pg)
             try:
-                raw_products = await _run_flipkart_search(page, query)
-                if not raw_products:
-                    raise RuntimeError("no_results_from_flipkart")
-                source_used = "flipkart"
-            except (PlaywrightTimeoutError, PlaywrightError, RuntimeError) as err2:
-                logger.warning("[search] Flipkart also failed: %s -- using local fallback", err2)
-
-                if not registry.is_task_valid(task_id):
-                    return _stale(task_id)
-
-                # --- ATTEMPT 3: Local fallback (always works) ---
-                source_used = "local_fallback_demo_page"
+                runner = SITE_RUNNERS.get(site_name)
+                if not runner:
+                    return []
+                prods = await runner(pg, query)
+                disp = SITE_DISPLAY_NAMES.get(site_name, site_name.capitalize())
+                for p in prods:
+                    p["site"] = disp
+                logger.info("[search] Site %s returned %d products", site_name, len(prods))
+                return prods
+            except Exception as err:
+                logger.warning("[search] Site %s error: %s", site_name, err)
+                return []
+            finally:
                 try:
-                    raw_products = await _run_fallback_search(page, query)
-                except Exception as fallback_err:
-                    registry.mark_error(task_id, str(fallback_err))
-                    return _clean_error(
-                        task_id,
-                        f"all_sources_failed: amazon={primary_err}; flipkart={err2}; fallback={fallback_err}",
-                    )
+                    if not pg.is_closed():
+                        await pg.close()
+                except Exception:
+                    pass
+
+        # High-speed dynamic parallel execution:
+        # Launch all sites concurrently. As soon as at least 2 distinct stores
+        # have returned products (providing side-by-side multi-store comparison)
+        # with >= 8 products total, OR when a 4.0-second soft limit is reached, proceed immediately!
+        scrape_tasks = {
+            asyncio.create_task(_scrape_site(s)): s
+            for s in sites_to_search
+        }
+        site_raw_results: Dict[str, list] = {}
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 8.0
+
+        while scrape_tasks and loop.time() < deadline:
+            remaining_time = max(0.1, deadline - loop.time())
+            done, _ = await asyncio.wait(
+                scrape_tasks.keys(),
+                timeout=remaining_time,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in done:
+                s_name = scrape_tasks.pop(t)
+                try:
+                    prods = t.result()
+                    if prods:
+                        site_raw_results[s_name] = prods
+                except Exception as err:
+                    logger.warning("[search] Site %s error in fast pool: %s", s_name, err)
+
+            # Check early exit condition: >= 2 stores with products, total >= 8 products
+            if len(site_raw_results) >= 2 and sum(len(p) for p in site_raw_results.values()) >= 8:
+                logger.info("[search] Fast early-exit: got %d stores (%s) with %d products in fast pool!",
+                            len(site_raw_results), list(site_raw_results.keys()),
+                            sum(len(p) for p in site_raw_results.values()))
+                break
+
+        # Cancel any stragglers still hanging
+        for t in scrape_tasks.keys():
+            t.cancel()
 
         if not registry.is_task_valid(task_id):
             return _stale(task_id)
 
-        ranked = filter_and_rank(raw_products, max_price=max_price, size=size, top_n=MAX_RESULTS, query=query)
+        # Apply constraint filtering and ranking per site
+        filtered_by_site: Dict[str, list] = {}
+        for site_name, raw_list in site_raw_results.items():
+            disp = SITE_DISPLAY_NAMES.get(site_name, site_name.capitalize())
+            logger.info("[search] Site %s (disp=%s) raw=%d sample=%s", site_name, disp, len(raw_list), [p.get('name', '')[:20] for p in raw_list[:2]])
+            filtered = filter_and_rank(
+                raw_list,
+                max_price=max_price,
+                min_price=min_price,
+                size=size,
+                rank_by=rank_by,
+                top_n=MAX_RESULTS,
+                query=query,
+            )
+            logger.info("[search] Site %s filtered=%d", site_name, len(filtered))
+            if filtered:
+                filtered_by_site[disp] = filtered
+
+        # Multi-Store Interleaving: round-robin top picks from each store
+        # to ensure recommendations feature multiple distinct websites
+        ranked = []
+        if filtered_by_site:
+            max_len = max(len(lst) for lst in filtered_by_site.values())
+            for idx in range(max_len):
+                for disp_site, p_list in filtered_by_site.items():
+                    if idx < len(p_list):
+                        ranked.append(p_list[idx])
+                        if len(ranked) >= MAX_RESULTS:
+                            break
+                if len(ranked) >= MAX_RESULTS:
+                    break
+
+        sources_found = list(filtered_by_site.keys())
+        source_label = ", ".join(sources_found) if sources_found else (sites_to_search[0] if sites_to_search else "live")
 
         result: Dict[str, Any] = {
             "task_id": task_id,
             "status": "completed",
-            "source": source_used,
+            "source": source_label,
+            "sources": sources_found,
             "query": query,
-            "parsed_constraints": {"max_price": max_price, "size": size},
+            "parsed_constraints": {
+                "min_price": min_price,
+                "max_price": max_price,
+                "size": size,
+                "rank_by": rank_by,
+            },
             "results": ranked,
         }
-        if source_used == "local_fallback_demo_page":
-            result["warning"] = (
-                "Live e-commerce sites were unreachable or blocked automation. "
-                "These results are from a LOCAL FALLBACK DEMO PAGE, not live web data."
-            )
         if not ranked:
             result["status"] = "completed_empty"
-            result["note"] = "No products matched the given constraints."
+            result["note"] = f"No products matched the given constraints on live shopping sites ({source_label})."
 
         if not registry.is_task_valid(task_id):
             return _stale(task_id)
@@ -393,11 +551,6 @@ async def search_products(query: str, task_id: str) -> Dict[str, Any]:
         return _clean_error(task_id, f"unexpected_error: {e}")
 
     finally:
-        try:
-            if page and not page.is_closed():
-                await page.close()
-        except Exception:
-            pass
         try:
             if context:
                 await context.close()

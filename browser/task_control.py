@@ -41,9 +41,8 @@ class _TaskRecord:
         self.created_at = time.time()
         self.result: Optional[Dict[str, Any]] = None
         self.error: Optional[str] = None
-        # Playwright Page tied to this task, kept as "Any" so this module
-        # never needs to import playwright types.
         self.page = None
+        self.pages = []
 
 
 class TaskRegistry:
@@ -88,6 +87,8 @@ class TaskRegistry:
             rec = self._tasks.get(task_id)
             if rec:
                 rec.page = page
+                if page not in rec.pages:
+                    rec.pages.append(page)
 
     def mark_completed(self, task_id: str, result: Dict[str, Any]) -> None:
         with self._lock:
@@ -106,40 +107,27 @@ class TaskRegistry:
     # ------------------------------------------------------------- cancel
     def cancel_task(self, task_id: str) -> Dict[str, Any]:
         """
-        Marks a task cancelled and, if a live Playwright page is attached,
-        attempts to close it so in-flight navigation aborts immediately.
-
-        Never raises -- safe to call freely from an API endpoint the moment
-        a user interrupts.
-
-        NOTE on the distinction the spec calls out:
-          - Setting status=CANCELLED (and is_task_valid() -> False) is what
-            GUARANTEES stale results are discarded. This always happens.
-          - Actually closing the Playwright page is a best-effort attempt at
-            REAL execution cancellation. It usually works, but even if it
-            didn't, the guarantee above still holds.
+        Marks a task cancelled and, if live Playwright pages are attached,
+        attempts to close all of them so in-flight navigations abort immediately.
         """
         with self._lock:
             rec = self._tasks.get(task_id)
             if not rec:
                 return {"task_id": task_id, "cancelled": False, "reason": "unknown_task"}
 
-            page = rec.page
+            pages = list(rec.pages) if rec.pages else ([rec.page] if rec.page else [])
             rec.status = TaskState.CANCELLED
 
         physically_stopped = False
-        if page is not None:
-            try:
-                if not page.is_closed():
-                    import asyncio
-                    # Fire-and-forget close. If a coroutine is currently
-                    # awaiting navigation/extraction on this page, Playwright
-                    # will raise inside that await (search.py treats this as
-                    # a cancellation, not a crash).
-                    asyncio.create_task(page.close())
-                    physically_stopped = True
-            except Exception:
-                physically_stopped = False
+        import asyncio
+        for p in pages:
+            if p is not None:
+                try:
+                    if not p.is_closed():
+                        asyncio.create_task(p.close())
+                        physically_stopped = True
+                except Exception:
+                    pass
 
         return {
             "task_id": task_id,

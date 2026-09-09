@@ -49,6 +49,7 @@ class BrowserManager:
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
                     "--start-maximized",
                 ],
             )
@@ -67,8 +68,8 @@ class BrowserManager:
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
         )
-        context.set_default_navigation_timeout(20000)
-        context.set_default_timeout(8000)
+        context.set_default_navigation_timeout(12000)
+        context.set_default_timeout(6000)
         return context
 
     async def shutdown(self) -> None:

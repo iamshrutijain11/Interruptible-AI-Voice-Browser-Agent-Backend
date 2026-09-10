@@ -63,7 +63,8 @@ _COLORS = {
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "in", "of", "for", "to", "is", "it", "that",
     "this", "find", "search", "show", "me", "some", "get", "want", "finally", "please",
-    "between", "from", "above", "below", "under"
+    "between", "from", "above", "below", "under", "make", "change", "switch", "only",
+    "also", "now", "just", "them", "ones", "one"
 }
 _LEADING_FILLER = [
     "wait,", "wait", "actually,", "actually", "no,", "no wait",
@@ -71,6 +72,7 @@ _LEADING_FILLER = [
     "sorry,", "sorry", "hang on,", "hang on", "finally,", "finally",
     "show me", "get me", "find me", "can you show", "can you find",
     "i want", "i'm looking for", "looking for", "some",
+    "make it", "make them", "change to", "switch to",
 ]
 
 
@@ -201,10 +203,27 @@ def parse_utterance_mock(
     )
     product_phrase = _extract_product_phrase(cleaned, color=color)
 
-    if prior is not None:
+    # Detect if user asks to clear price limit (e.g. "any price", "all prices", "no limit", "clear filter")
+    clears_price = bool(re.search(r"\b(any price|all prices|no budget|no price|clear filter|all items|any budget|no limit)\b", cleaned, re.IGNORECASE))
+
+    # Detect if this is a brand new product search rather than an attribute refinement
+    is_new_product = False
+    if prior is not None and prior.query and product_phrase:
+        old_tokens = set(re.findall(r"[a-z0-9]+", prior.query.lower()))
+        new_tokens = set(re.findall(r"[a-z0-9]+", product_phrase.lower()))
+        common = old_tokens & new_tokens - {"men", "women", "kids", "boy", "girl", "for", "with", "and", "the", "a", "of"}
+        if not common:
+            # Entirely distinct product phrase -> brand new task, do not inherit old constraints!
+            is_new_product = True
+
+    if prior is not None and not is_new_product:
         constraints = constraints.merged_with(prior.constraints)
         if not product_phrase:
             product_phrase = prior.query
+
+    if clears_price:
+        constraints.min_price = None
+        constraints.max_price = None
 
     # Translate known Indic transliterations to English for search sites
     words_en = []
@@ -314,11 +333,20 @@ async def parse_utterance_gemini(
     intent = ParsedIntent(**data)
 
     if prior is not None:
-        intent.constraints = intent.constraints.merged_with(prior.constraints)
-        if not intent.query:
-            intent.query = prior.query
-        if not intent.query_en:
-            intent.query_en = prior.query_en or prior.query
+        is_new_product = False
+        if prior.query and intent.query:
+            old_tokens = set(re.findall(r"[a-z0-9]+", prior.query.lower()))
+            new_tokens = set(re.findall(r"[a-z0-9]+", intent.query.lower()))
+            common = old_tokens & new_tokens - {"men", "women", "kids", "boy", "girl", "for", "with", "and", "the", "a", "of"}
+            if not common:
+                is_new_product = True
+
+        if not is_new_product:
+            intent.constraints = intent.constraints.merged_with(prior.constraints)
+            if not intent.query:
+                intent.query = prior.query
+            if not intent.query_en:
+                intent.query_en = prior.query_en or prior.query
         # Carry forward language if LLM didn't detect one
         if not intent.detected_language or intent.detected_language == "und":
             intent.detected_language = prior.detected_language or "en"
